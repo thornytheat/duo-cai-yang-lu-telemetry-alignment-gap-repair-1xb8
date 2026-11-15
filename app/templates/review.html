@@ -3,10 +3,11 @@
 {% block crumb %}质量复核{% endblock %}
 {% block meta %}<span class="dot {% if report.summary.drifted_pairs %}warn{% else %}ok{% endif %}"></span>数据集 {{ dataset.dataset_id }} · {{ report.summary.pairs }} 个序列 · 阈值 {{ report.threshold_s | fmt(1) }}s{% endblock %}
 {% block actions %}
+<a class="btn secondary small" href="/shift">班次交接</a>
 <a class="btn secondary small" href="/api/report">JSON</a>
 <a class="btn small" href="/api/report.csv">导出 CSV</a>
 {% endblock %}
-{% block status_left %}全部 {{ report.summary.pairs }} 个「设备 × 指标」逐条走完对齐流水线后汇总 · 同一数据集按阈值缓存重算{% endblock %}
+{% block status_left %}全部 {{ report.summary.pairs }} 个「设备 × 指标」逐条走完对齐流水线后汇总 · 同一数据集按阈值缓存重算 · 本页为整窗口径，交接/分级以班次交接的已发布版本为准{% endblock %}
 {% block status_right %}平均覆盖率 {{ report.summary.avg_coverage | pct(2) }} · 缺口 {{ report.summary.total_gaps }} 处 · 漂移 {{ report.summary.drifted_pairs }} 个序列{% endblock %}
 
 {% block content %}
@@ -194,7 +195,9 @@
           <div class="small" style="margin-top:6px">
             CSV 列：device_id, metric, interval_s, expected_cells, raw_cells, carried_cells, interpolated_cells,
             unrepaired_cells, valid_cells, coverage, grade, gap_count, offset_s, rate_ppm, rmse_s, drifted。
-            <div style="margin-top:6px">导出的是当前数据集 + 当前阈值的全量结果；按阈值重新计算会得到不同的分级。</div>
+            <div style="margin-top:6px">导出的是当前数据集 + 当前阈值的<strong>整窗</strong>结果；按阈值重新计算会得到不同的分级。</div>
+            <div style="margin-top:6px">班次交接的导出（含版本、成熟水位、待定尾部与两次发布差异）在
+              <a href="/shift">班次交接</a> → 「导出当前版 CSV」，两者的统计口径不同，不要混用。</div>
           </div>
         </details>
       </div>

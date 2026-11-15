@@ -7,6 +7,7 @@
 {% endblock %}
 {% block actions %}
 <a class="btn secondary small" href="/workbench">回工作台</a>
+<a class="btn secondary small" href="/shift?device={{ run.device_id }}&metric={{ run.metric }}">班次交接</a>
 <a class="btn secondary small" href="/review">质量报告</a>
 <a class="btn small" href="/api/report.csv">导出 CSV</a>
 {% endblock %}
@@ -70,6 +71,16 @@
     <div class="k-note">6 步真实测量</div>
   </div>
 </div>
+
+{% if live_shift %}
+<div class="alert alert-info" style="margin-bottom:12px">
+  该「设备 × 指标」已有班次交接发布：<strong>v{{ live_shift.version }}r{{ live_shift.revision }}</strong>
+  （水位 {{ live_shift.release.watermark.time or '—' }}，成熟 {{ live_shift.release.watermark.mature_cells }} 格，
+  待定尾部 {{ live_shift.release.pending_tail.cells }} 格，成熟段分级 {{ live_shift.release.coverage.grade }}）。
+  本结果页是整窗对齐预览，口径与交接版不同——分级与导出请以
+  <a href="/shift?device={{ run.device_id }}&metric={{ run.metric }}">班次交接</a> 的已发布版本为准。
+</div>
+{% endif %}
 
 <div class="panel">
   <div class="panel-head">

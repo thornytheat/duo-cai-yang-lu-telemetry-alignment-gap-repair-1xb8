@@ -16,6 +16,7 @@
 | 缺口判定 | 结果页「三、缺口明细」 | `app/gaps.py` |
 | 摘要 | 结果页「四、小时摘要」 | `app/summary.py` |
 | 质量报告 | `/review`、`/api/report(.csv)` | `app/quality.py` |
+| 班次交接 | `/shift`、`/api/shift/*` | `app/shift.py` |
 
 ## 核心规则（全部后端真算，纯函数模块可直接单测）
 
@@ -34,6 +35,18 @@
 4. **摘要**：每小时 `min/max/mean/p95` + 缺口格数 + carried 格数（p95 为线性插值分位数）。
 5. **质量分**：`coverage = 有效格 / 应到格`（有效 = 原始 ∪ 沿用 ∪ 插补），
    分级 `≥0.98 A / ≥0.95 B / else C`；另给出 raw 覆盖率（不含沿用与插补）以便区分「有数据」和「补出来的数据」。
+6. **班次交接（成熟水位）**：按时出结果，但不把尾部尚未成熟的空白当成缺口或提前插补。
+   - 每台设备有最晚到点界限 `ARRIVAL_DEADLINE_BY_DEVICE`（1s 120s / 5s 180s / 60s 300s）；
+     桶 `b` 的记录须在 `(b+1)·60 + 界限` 前到齐。交班时刻扣掉界限得到**成熟水位**，
+     水位及之前为已成熟，之后为**待定尾部**。
+   - 待定尾部**不判缺口、不插补、不 hold 补值**，只登记已到的原始值并单列；
+     它不进入小时摘要、班次摘要与质量分级。
+   - 迟到批次/迟到记录：未到位（`arrived_at` 晚于交班时刻）会把水位压在该批次起点之前；
+     到位后水位前推，并从批次起点（含 hold/插补向两侧传播的范围）到新水位**重算受影响分钟**。
+   - 发布前**整批核验**（水位、成熟/待定格、样本计数、缺口范围、摘要口径、内容摘要），
+     通过后在单个事务里**原子替换** live 版；核验或写入失败**保留上一版**。
+   - 版本按水位去重：**同一水位重跑且内容一致 → 不新增版本**（复用）；同一水位内容变化 → 仅 `revision+1`；
+     水位推进 → 新版本号。结果页与 CSV 导出同时给出**版本、待定尾部、与上一版的差异**。
 
 ## 启动
 
@@ -56,6 +69,11 @@ docker compose run --rm app python -m pytest -q
 4. 切 `LINE-A-02` 温度：3 分钟降级段被 hold 沿用（carried 30 格），覆盖率 95.28% → **B**。
 5. 切 `LINE-A-03` 压力：01:40–02:05 断采，覆盖率 91.67% → **C**。
 6. `/review` 看三台设备 A/B/C 分级与跨设备对比，导出 CSV。
+7. `/shift` 选 `LINE-A-03` + 温度、交班时刻填 `2026-05-12T06:00:00+08:00`：
+   水位 **05:54**（界限 300s），成熟 355 格、待定尾部 5 格；点「核验并发布」得到 **v1r1**。
+   把交班时刻改成 `06:10` 再发布 → **v2r1**，差异栏显示「水位前推 3 格；新成熟 3 格；待定尾部 3 → 0」。
+   同一参数重跑发布 → 「复用版本 v2r1，不新增版本」。
+   在迟到补报里登记一条未到位记录（`arrived_at` 晚于交班）→ 水位被压住，尾部扩大；改成已到位 → 水位前推并显示受影响的分钟。
 
 ## API
 
@@ -67,8 +85,13 @@ docker compose run --rm app python -m pytest -q
 | GET | `/api/runs/{run_id}` | 取某次对齐结果 JSON |
 | GET | `/api/report` | 全部「设备 × 指标」的质量报告 JSON |
 | GET | `/api/report.csv` | 质量报告 CSV（`device_id,metric,...,coverage,grade,...`） |
+| POST | `/api/shift/preview` | `{device_id,metric,handover_at,late_batches?,late_records?,offset_threshold?}` → 只算不发布：水位、待定尾部、将发布的版本、与 live 的差异 |
+| POST | `/api/shift/publish` | 同上入参 → 整批核验后原子发布；核验失败 422 且保留上一版 |
+| GET | `/api/shift/live?device_id=&metric=` | 当前 live 版（含版本号、待定尾部、差异） |
+| GET | `/api/shift/versions?device_id=&metric=` | 发布历史（版本 / 修订 / 水位 / 是否 live） |
+| GET | `/api/shift/export.csv?device_id=&metric=&version=` | 导出已发布交接结果（版本、待定尾部、两次发布差异同表核对） |
 | GET | `/result/{run_id}` | 结果页（漂移依据、网格预览、缺口明细、小时摘要、覆盖率） |
-| GET | `/`、`/workbench`、`/review` | 首页 / 工作台 / 质量报告 |
+| GET | `/`、`/workbench`、`/shift`、`/review` | 首页 / 工作台 / 班次交接 / 质量报告 |
 
 错误输入统一 4xx 中文提示：不存在的设备、设备没有该指标、阈值非数字或越界、请求体非 JSON。
 
@@ -82,6 +105,7 @@ docker compose run --rm app python -m pytest -q
 | 对齐工作台 | `/workbench` | 左侧 sticky「对齐任务」（数据集 / 设备·指标 / 漂移阈值 / 缺口策略 + 底部执行按钮），右侧按当前选择真算的**预演**（不落库）：漂移估计、网格预览、缺口判定、小时摘要 |
 | 对齐结果 | `/result/{run_id}` | 头部结论 + KPI 条 + 分段详情（网格预览 / 漂移依据 / 缺口明细 / 小时摘要 / 覆盖率与耗时），长依据表在容器内滚动 |
 | 质量复核 | `/review` | 工具栏（设备 / 指标 / 搜索 / 导出）+ 跨设备质量对比表 + 右侧 sticky 质量报告 |
+| 班次交接 | `/shift` | 交班时刻 + 设备到点界限 → 成熟水位与待定尾部；迟到批次/记录登记；两次发布差异；成熟段小时摘要；发布历史与按版本导出 |
 
 侧栏「业务模块」6 个锚点对应流水线：数据导入 `#m1` → 漂移估计 `#m2` → 网格重采样 `#m3` → 缺口判定 `#m4` → 小时摘要 `#m5` → 质量报告 `/review#m6`。
 
@@ -97,13 +121,14 @@ app/
   gaps.py        缺口判定与有限插补（首尾不外推）
   summary.py     小时摘要（min/max/mean/p95 + 缺口 + carried）
   quality.py     覆盖率、分级、跨设备汇总、CSV
+  shift.py       班次交接：成熟水位、待定尾部、迟到重算、原子发布与差异
   pipeline.py    6 步编排 + 阶段耗时
   store.py       SQLite（数据集、运行结果、seed 版本）
   seed.py        幂等 seed
-  templates/     index / workbench / result / review
-  static/        app.js、style.css、shell.css（原生，无框架无 CDN）
+  templates/     index / workbench / result / review / shift
+  static/        app.js、shift.js、style.css、shell.css（原生，无框架无 CDN）
 sample_data/telemetry/  3 台设备 6 小时 CSV + _generate.py（确定性生成脚本）
-tests/                  test_drift / test_resample / test_gaps / test_api
+tests/                  test_drift / test_resample / test_gaps / test_shift / test_api
 ```
 
 ## 已知限制
@@ -114,3 +139,6 @@ tests/                  test_drift / test_resample / test_gaps / test_api
 - 覆盖率把沿用与插补算作有效格，因此同时输出 raw 覆盖率与 carried/插补计数供复核。
 - 样例数据为确定性生成（三角波 + 极小噪声），非真实产线采集；1s × 6 小时共 21120 行，
   仓库体积约 2.5MB，属于该场景固有体量。
+- 班次交接与工作台/复核页的口径不同：前者的分级与摘要只统计成熟时段，后者是整窗预览。
+  结果页在已有发布版本时会显式提示，导出也分别位于 `/api/shift/export.csv` 与 `/api/report.csv`。
+- 迟到补报通过接口/页面登记（`late_batches` / `late_records`），不修改原始 CSV；批次到位后需要重新发布才会成为 live。

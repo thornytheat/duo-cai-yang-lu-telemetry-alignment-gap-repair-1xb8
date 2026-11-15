@@ -192,7 +192,9 @@
         '<p class="small">缺口 <strong>' + data.gaps.count + '</strong> 处（插补 ' + data.gaps.interpolated_cells +
           ' 格 / 未修复 ' + data.gaps.unrepaired_cells + ' 格），carried ' + data.grid.held_cells + ' 格，' +
           '覆盖率 <strong>' + (cov.coverage * 100).toFixed(2) + '%</strong> ' + tagForGrade(cov.grade) + '</p>' +
-        '<p><a class="btn small" href="/result/' + data.run_id + '">查看完整结果与依据 →</a></p>';
+        '<p><a class="btn small" href="/result/' + data.run_id + '">查看完整结果与依据 →</a> ' +
+          '<a class="btn secondary small" href="/shift?device=' + encodeURIComponent(data.device_id) +
+          '&metric=' + encodeURIComponent(data.metric) + '">去做班次交接 →</a></p>';
     }
   }
 

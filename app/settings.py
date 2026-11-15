@@ -21,6 +21,16 @@ INTERPOLATE_MAX_CELLS = 3      # 缺口 <= 3 格 -> 线性插补；> 3 格 -> un
 GRADE_A_COVERAGE = 0.98
 GRADE_B_COVERAGE = 0.95
 
+# 班次交接：每台设备的最晚到点界限（秒）。
+# 一个 1 分钟桶 b 覆盖 [b*60, (b+1)*60)，其记录须在 (b+1)*60 + deadline 之前到齐；
+# 交接时刻扣除该界限后得到设备的成熟水位，水位之后的桶是待定尾部。
+ARRIVAL_DEADLINE_BY_DEVICE = {
+    "LINE-A-01": 120.0,   # 1s 设备：2 分钟
+    "LINE-A-02": 180.0,   # 5s 设备：3 分钟
+    "LINE-A-03": 300.0,   # 60s 设备：5 分钟（含归档器降级余量）
+}
+ARRIVAL_DEADLINE_DEFAULT_S = 180.0
+
 METRICS = ("temperature", "pressure")
 METRIC_LABEL = {"temperature": "温度", "pressure": "压力"}
 METRIC_UNIT = {"temperature": "℃", "pressure": "bar"}

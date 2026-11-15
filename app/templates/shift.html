@@ -1,0 +1,425 @@
+{% extends "base.html" %}
+{% block title %}班次交接 · {{ app_name }}{% endblock %}
+{% block crumb %}班次交接{% endblock %}
+{% block meta %}
+{% if preview %}<span class="dot {% if preview.release.watermark.pending_cells %}warn{% else %}ok{% endif %}"></span>
+{{ selected_device }} · {{ metric_labels.get(selected_metric, selected_metric) }} · 水位 {{ preview.release.watermark.time }} · 待定 {{ preview.release.watermark.pending_cells }} 格
+{% else %}<span class="dot err"></span>无可用预览{% endif %}
+{% endblock %}
+{% block actions %}
+<a class="btn secondary small" href="/workbench">对齐工作台</a>
+<a class="btn secondary small" href="/review">质量复核</a>
+{% endblock %}
+{% block status_left %}成熟水位 = 整桶 + 设备最晚到点界限 ≤ 交班时刻；尾部待定不插补；整批核验后原子替换{% endblock %}
+{% block status_right %}{% if live %}当前 live v{{ live.version }}r{{ live.revision }} · 水位 {{ preview.release.watermark.time if preview else '—' }}{% else %}该序列还没有已发布版本{% endif %}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">班次交接</h1>
+    <p class="page-sub">
+      按每台设备的最晚到点界限推进成熟水位：水位之后是<strong>待定尾部</strong>，不当成缺口、不提前插补，单独列出；
+      迟到记录到位后水位前推，并从批次起点重算受影响分钟。摘要与分级只统计已成熟时段，
+      核验通过才原子替换，失败保留上一版；同一水位重跑不新增版本。
+    </p>
+  </div>
+</div>
+
+<div class="toolbar" style="border:1px solid var(--line);border-radius:10px;background:#fff;margin-bottom:12px">
+  <form method="get" action="/shift" class="toolbar" style="border:0;margin:0;padding:0;background:transparent">
+    <select name="device" aria-label="设备" onchange="this.form.submit()">
+      {% for dev in devices %}
+      <option value="{{ dev }}" {{ 'selected' if dev == selected_device else '' }}>{{ dev }}{% if dev in deadlines %}（界限 {{ deadlines[dev] | fmt(0) }}s）{% endif %}</option>
+      {% endfor %}
+    </select>
+    <select name="metric" aria-label="指标" onchange="this.form.submit()">
+      {% for m in selected_metrics %}
+      <option value="{{ m }}" {{ 'selected' if m == selected_metric else '' }}>{{ metric_labels.get(m, m) }}</option>
+      {% endfor %}
+    </select>
+    <input type="text" name="at" value="{{ handover_at }}" aria-label="交班时刻" placeholder="交班时刻 ISO-8601" style="min-width:230px" hidden>
+    <button type="submit" class="btn secondary small">切换并重算</button>
+  </form>
+  <span class="spacer"></span>
+  <button id="shift-publish" type="button" class="btn small"
+          data-device="{{ selected_device }}" data-metric="{{ selected_metric }}">核验并发布</button>
+  {% if live %}
+  <a class="btn secondary small" href="/api/shift/export.csv?device_id={{ selected_device }}&metric={{ selected_metric }}">导出当前版 CSV</a>
+  {% endif %}
+</div>
+
+<div class="panel" style="margin-bottom:12px">
+  <div class="panel-head">
+    <h3>交班参数与迟到补报</h3>
+    <div class="panel-actions"><span class="tag">JSON · 可选</span></div>
+  </div>
+  <form method="get" action="/shift" class="panel-body tight">
+    <input type="hidden" name="device" value="{{ selected_device }}">
+    <input type="hidden" name="metric" value="{{ selected_metric }}">
+    <div class="field">
+      <label for="handover-at">交班时刻（ISO-8601，带时区）</label>
+      <input id="handover-at" type="text" name="at" value="{{ handover_at }}" style="width:100%">
+    </div>
+    <div class="field">
+      <label for="shift-threshold">漂移阈值（秒）</label>
+      <input id="shift-threshold" type="text" name="threshold" value="{{ threshold_text }}" style="width:160px">
+    </div>
+    <div class="field">
+      <label for="late-json">迟到批次 / 迟到记录（到位后推动水位并重算受影响分钟）</label>
+      <textarea id="late-json" name="late" rows="6" class="mono small" style="width:100%"
+        placeholder='{"late_batches": [{"start_bucket": 1, "end_bucket": 3, "arrived_at": "..."}], "late_records": [{"ts": "...", "value": 21.0, "arrived_at": "..."}]}'>{{ late_text }}</textarea>
+      <div class="small muted" style="margin-top:4px">
+        late_batches 用 start_bucket / end_bucket（end 不含）；late_records 是原始点级补报。
+        arrived_at 晚于交班时刻视为未到位：水位压在该批次起点之前，尾部仍是待定。
+        已经发布过的水位只前进不回退：未到位记录落在已发布成熟区内时，该格保持已发布结论（发布时会做同水位修订）。
+      </div>
+    </div>
+    <div class="panel-actions" style="padding:0">
+      <button type="submit" class="btn secondary small">重算预览</button>
+    </div>
+  </form>
+</div>
+
+<div id="shift-msg" class="small" hidden style="margin-bottom:10px"></div>
+{% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+
+{% if preview %}
+{% set r = preview.release %}
+{% set wm = r.watermark %}
+{% set cov = r.coverage %}
+{% set plan = preview.plan %}
+{% set d = preview.diff %}
+<div class="kpi-strip">
+  <div class="kpi ok">
+    <div class="k-label">成熟水位</div>
+    <div class="k-value" style="font-size:17px">{{ wm.time or '—' }}</div>
+    <div class="k-note">成熟 {{ wm.mature_cells }} 格 · 界限 {{ r.arrival_deadline_s | fmt(0) }}s</div>
+  </div>
+  <div class="kpi {% if wm.pending_cells %}warn{% else %}ok{% endif %}">
+    <div class="k-label">待定尾部</div>
+    <div class="k-value">{{ wm.pending_cells }}</div>
+    <div class="k-note">单列，不计缺口 / 不插补 / 不进摘要</div>
+  </div>
+  <div class="kpi {% if cov.grade == 'A' %}ok{% elif cov.grade == 'B' %}warn{% else %}err{% endif %}">
+    <div class="k-label">成熟段覆盖率</div>
+    <div class="k-value">{{ cov.coverage | pct(2) }}</div>
+    <div class="k-note">{{ cov.valid_cells }} / {{ cov.expected_cells }} 成熟格 · 分级 {{ cov.grade }}</div>
+  </div>
+  <div class="kpi {% if r.gaps.count %}warn{% else %}ok{% endif %}">
+    <div class="k-label">成熟段缺口</div>
+    <div class="k-value">{{ r.gaps.count }}</div>
+    <div class="k-note">插补 {{ r.gaps.interpolated_cells }} · 未修复 {{ r.gaps.unrepaired_cells }}</div>
+  </div>
+  <div class="kpi">
+    <div class="k-label">将发布的版本</div>
+    <div class="k-value" style="font-size:17px">v{{ plan.version }}r{{ plan.revision }}</div>
+    <div class="k-note">{{ plan.note }}</div>
+  </div>
+  <div class="kpi {% if d and not d.first_release %}warn{% endif %}">
+    <div class="k-label">相对上一版</div>
+    <div class="k-value" style="font-size:15px">
+      {% if d and not d.first_release %}
+        {{ '+' if d.watermark_advanced_buckets > 0 else '' }}{{ d.watermark_advanced_buckets }} 格
+      {% else %}首次{% endif %}
+    </div>
+    <div class="k-note">{% if d %}{{ d.summary }}{% else %}—{% endif %}</div>
+  </div>
+</div>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>一、成熟水位与待定尾部</h2>
+    <div class="panel-actions">
+      <span class="tag">窗口 {{ r.window.start }} → {{ r.window.end }}</span>
+      <span class="tag">共 {{ r.window.total_cells }} 格</span>
+    </div>
+  </div>
+  <div class="panel-body tight">
+    <p style="margin:0"><strong>水位规则：</strong>{{ wm.rule }}。交班时刻 {{ r.handover_at }}，
+      设备 {{ r.device_id }} 到点界限 {{ r.arrival_deadline_s | fmt(0) }}s → 成熟水位
+      <strong>{{ wm.time }}</strong>（含）之前为已成熟，之后 {{ wm.pending_cells }} 格为待定尾部。</p>
+    <p style="margin:4px 0 0"><strong>待定尾部：</strong>{{ r.pending_tail.reason }}。</p>
+  </div>
+  <div class="table-wrap auto">
+    <table class="dense">
+      <thead><tr><th style="width:64px">状态</th><th style="width:180px">起始桶</th><th style="width:180px">结束桶</th>
+        <th style="width:70px">格数</th><th style="width:110px">已到原始值</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><span class="tag ok">已成熟</span></td>
+          <td class="small muted nowrap">{{ r.shift_summary.mature_start }}</td>
+          <td class="small muted nowrap">{{ r.shift_summary.mature_end or '—' }}</td>
+          <td class="num">{{ wm.mature_cells }}</td>
+          <td class="num">{{ r.shift_summary.value_cells }}</td>
+          <td class="small">参与缺口判定、小时摘要与质量分级</td>
+        </tr>
+        <tr>
+          <td><span class="tag warn">待定</span></td>
+          <td class="small muted nowrap">{{ r.pending_tail.start or '—' }}</td>
+          <td class="small muted nowrap">{{ r.pending_tail.end or '—' }}</td>
+          <td class="num">{{ r.pending_tail.cells }}</td>
+          <td class="num">{{ r.pending_tail.value_cells }}</td>
+          <td class="small">尾部保持待定：不判缺口、不插补，已到的原始值只登记备查</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>二、迟到批次（到位后推动水位）</h2>
+    <div class="panel-actions"><span class="tag">{{ r.late_batches | length }} 个批次</span></div>
+  </div>
+  {% if r.late_batches %}
+  <div class="table-wrap auto">
+    <table class="dense">
+      <thead><tr><th style="width:40px">#</th><th style="width:180px">批次起点</th><th style="width:180px">批次终点（不含）</th>
+        <th style="width:180px">到位时刻</th><th style="width:96px">状态</th></tr></thead>
+      <tbody>
+        {% for b in r.late_batches %}
+        <tr>
+          <td>{{ loop.index }}</td>
+          <td class="small muted nowrap">{{ b.start_time }}</td>
+          <td class="small muted nowrap">{{ b.end_time }}</td>
+          <td class="small muted nowrap">{{ b.arrived_time }}</td>
+          <td>
+            {% if b.status == 'outstanding' %}<span class="tag err">未到位 · 压住水位</span>
+            {% else %}<span class="tag ok">已到位</span>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="panel-body tight"><p class="small muted" style="margin:0">没有登记迟到批次；水位只由设备到点界限决定。</p></div>
+  {% endif %}
+  {% if r.late_records %}
+  <div class="panel-body tight">
+    <p class="small muted" style="margin:0 0 6px">迟到记录（原始点级补报）：</p>
+  </div>
+  <div class="table-wrap auto">
+    <table class="dense">
+      <thead><tr><th style="width:40px">#</th><th style="width:170px">原始时刻</th><th style="width:170px">所在桶</th>
+        <th style="width:96px">值</th><th style="width:180px">到位时刻</th><th style="width:96px">状态</th></tr></thead>
+      <tbody>
+        {% for rec in r.late_records %}
+        <tr>
+          <td>{{ loop.index }}</td>
+          <td class="small muted nowrap">{{ rec.time }}</td>
+          <td class="small muted nowrap">{{ rec.bucket_start }}</td>
+          <td class="num">{{ rec.value | fmt(3) }}</td>
+          <td class="small muted nowrap">{{ rec.arrived_time }}</td>
+          <td>
+            {% if rec.status == 'outstanding' %}<span class="tag err">未到位 · 压住水位</span>
+            {% else %}<span class="tag ok">已到位</span>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+  {% if r.recomputed_span %}
+  <div class="panel-body tight">
+    <p class="small" style="margin:0"><strong>受影响分钟重算：</strong>{{ r.recomputed_span.reason }}
+      （{{ r.recomputed_span.cells }} 格，{{ r.recomputed_span.start }} → {{ r.recomputed_span.end }}）。</p>
+  </div>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>三、两次发布差异</h2>
+    <div class="panel-actions">
+      {% if live %}<span class="tag">上一版 v{{ live.version }}r{{ live.revision }}</span>{% else %}<span class="tag">无上一版</span>{% endif %}
+      <span class="tag">本次 v{{ plan.version }}r{{ plan.revision }}</span>
+    </div>
+  </div>
+  {% if d %}
+  <div class="panel-body tight">
+    <p style="margin:0">{{ d.summary }}</p>
+  </div>
+  <div class="table-wrap auto">
+    <table class="dense">
+      <tbody>
+        <tr><th style="width:200px">水位</th><td>
+          {% if d.first_release %}首次发布{% else %}{{ d.watermark_before.time or '—' }} → {{ d.watermark_after.time or '—' }}
+          （{{ '+' if d.watermark_advanced_buckets > 0 else '' }}{{ d.watermark_advanced_buckets }} 格）{% endif %}
+        </td></tr>
+        <tr><th>新成熟格</th><td>{{ d.newly_matured_cells }}
+          {% if d.newly_matured_first %}（{{ d.newly_matured_first }} → {{ d.newly_matured_last }}）{% endif %}</td></tr>
+        <tr><th>重算改动格</th><td>{{ d.changed_cells }}{% if d.changed_detail_truncated %}（明细仅列前 50 条）{% endif %}</td></tr>
+        {% if d.changed_pending_cells %}
+        <tr><th>待定内容变化</th><td>{{ d.changed_pending_cells }} 格（尾部值/点数变化，仍为待定）</td></tr>
+        {% endif %}
+        <tr><th>待定尾部</th><td>
+          {% if d.pending_before %}{{ d.pending_before.cells }} 格{% else %}—{% endif %} →
+          {{ d.pending_after.cells }} 格</td></tr>
+        <tr><th>覆盖率 / 分级</th><td>
+          {{ d.coverage_before | pct(2) if d.coverage_before is not none else '—' }} / {{ d.grade_before or '—' }} →
+          {{ d.coverage_after | pct(2) if d.coverage_after is not none else '—' }} / {{ d.grade_after or '—' }}</td></tr>
+        <tr><th>缺口 / 未修复</th><td>
+          {{ d.gap_count_before }} 处 / {{ d.unrepaired_before }} 格 →
+          {{ d.gap_count_after }} 处 / {{ d.unrepaired_after }} 格</td></tr>
+      </tbody>
+    </table>
+  </div>
+  {% if d.changed_detail %}
+  <div class="table-wrap auto">
+    <table class="dense">
+      <thead><tr><th style="width:180px">分钟桶</th><th>上一版值</th><th>上一版来源</th><th>本版值</th><th>本版来源</th></tr></thead>
+      <tbody>
+        {% for c in d.changed_detail %}
+        <tr>
+          <td class="small muted nowrap">{{ c.bucket_start }}</td>
+          <td class="num">{% if c.prev_value is not none %}{{ c.prev_value | fmt(3) }}{% else %}—{% endif %}</td>
+          <td class="small">{{ c.prev_source }}</td>
+          <td class="num">{% if c.value is not none %}{{ c.value | fmt(3) }}{% else %}—{% endif %}</td>
+          <td class="small">{{ c.source }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+  {% if d.changed_pending_detail %}
+  <div class="table-wrap auto">
+    <table class="dense">
+      <thead><tr><th style="width:180px">待定分钟桶</th><th>上一版值 / 点数</th><th>本版值 / 点数</th><th>变化</th></tr></thead>
+      <tbody>
+        {% for c in d.changed_pending_detail %}
+        <tr>
+          <td class="small muted nowrap">{{ c.bucket_start }}</td>
+          <td class="num">{% if c.prev_value is not none %}{{ c.prev_value | fmt(3) }}{% else %}—{% endif %} / {{ c.prev_samples }}</td>
+          <td class="num">{% if c.value is not none %}{{ c.value | fmt(3) }}{% else %}—{% endif %} / {{ c.samples }}</td>
+          <td class="small">{{ c.change }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+  {% else %}
+  <div class="panel-body tight"><p class="small muted" style="margin:0">还没有上一版可对比。</p></div>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>四、成熟段小时摘要（只统计已成熟时段）</h2>
+    <div class="panel-actions">
+      <span class="tag">{{ r.hourly | length }} 个小时桶</span>
+      <span class="tag warn">部分成熟的小时单列待定格</span>
+    </div>
+  </div>
+  <div class="table-wrap auto">
+    <table class="dense">
+      <thead><tr><th style="width:170px">小时起点</th><th style="width:78px">成熟格</th><th style="width:78px">待定格</th>
+        <th>min</th><th>max</th><th>mean</th><th>p95</th><th style="width:74px">缺口格</th><th style="width:74px">carried</th></tr></thead>
+      <tbody>
+        {% for hour in r.hourly %}
+        <tr>
+          <td class="small muted nowrap">{{ hour.hour_start }}{% if hour.partial %} <span class="tag warn">部分待定</span>{% endif %}</td>
+          <td class="num">{{ hour.mature_cells }}</td>
+          <td class="num">{% if hour.pending_cells %}<span class="tag warn">{{ hour.pending_cells }}</span>{% else %}0{% endif %}</td>
+          <td class="num">{{ hour.min | fmt(3) }}</td>
+          <td class="num">{{ hour.max | fmt(3) }}</td>
+          <td class="num">{{ hour.mean | fmt(3) }}</td>
+          <td class="num">{{ hour.p95 | fmt(3) }}</td>
+          <td>{% if hour.gap_cells %}<span class="tag err">{{ hour.gap_cells }}</span>{% else %}0{% endif %}</td>
+          <td>{% if hour.carried_cells %}<span class="tag warn">{{ hour.carried_cells }}</span>{% else %}0{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="panel-body tight">
+    <p class="small muted" style="margin:0">
+      统计量只取成熟格；待定尾部不参与 min/max/mean/p95。整段班次汇总：min {{ r.shift_summary.min | fmt(3) }}
+      · max {{ r.shift_summary.max | fmt(3) }} · mean {{ r.shift_summary.mean | fmt(3) }} · p95 {{ r.shift_summary.p95 | fmt(3) }}
+      · 缺口 {{ r.shift_summary.gap_count }} 处 · carried {{ r.shift_summary.carried_cells }} 格 · 待定 {{ r.shift_summary.pending_cells }} 格。
+    </p>
+    <p class="small" style="margin:6px 0 0">
+      <strong>时钟（只用成熟时段估计）：</strong>
+      {% if r.drift.available %}
+        偏移 {{ r.drift.offset_s | fmt(2) }} s · 走时 {{ r.drift.rate_ppm | fmt(1) }} ppm · 残差 {{ r.drift.rmse_s | fmt(3) }} s ·
+        {% if r.drift.drifted %}<span class="tag err">判定漂移（阈值 {{ r.threshold_s | fmt(1) }}s）</span>{% else %}<span class="tag ok">时钟正常（阈值 {{ r.threshold_s | fmt(1) }}s）</span>{% endif %}
+      {% else %}
+        <span class="muted">{{ r.drift.verdict }}{% if r.drift.reason %}（{{ r.drift.reason }}）{% endif %}</span>
+      {% endif %}
+    </p>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>五、成熟网格（水位之前，前 60 格预览）</h2>
+    <div class="panel-actions">
+      <span class="tag">聚合 {{ r.coverage.raw_cells }} · carried {{ r.coverage.carried_cells }}</span>
+      <span class="tag">插补 {{ r.coverage.interpolated_cells }}</span>
+      <span class="tag err">缺失 {{ r.coverage.missing_cells }}</span>
+    </div>
+  </div>
+  <div class="table-wrap roomy">
+    <table class="dense">
+      <thead><tr><th style="width:170px">分钟桶</th><th style="width:110px">值（{{ r.metric_unit }}）</th>
+        <th style="width:110px">来源</th><th style="width:80px">原始点数</th><th style="width:76px">carried</th></tr></thead>
+      <tbody>
+        {% for cell in r.preview %}
+        <tr>
+          <td class="small muted nowrap">{{ cell.bucket_start }}</td>
+          <td class="num">{% if cell.value is not none %}{{ cell.value | fmt(3) }}{% else %}<span class="muted">—</span>{% endif %}</td>
+          <td>
+            {% if cell.source == 'agg' %}<span class="tag">聚合 agg</span>
+            {% elif cell.source == 'sample' %}<span class="tag">原始采样</span>
+            {% elif cell.source == 'hold' %}<span class="tag warn">沿用 hold</span>
+            {% elif cell.source == 'interpolated' %}<span class="tag warn">插补</span>
+            {% else %}<span class="tag err">空缺</span>{% endif %}
+          </td>
+          <td class="num">{{ cell.samples }}</td>
+          <td>{% if cell.carried %}<span class="tag warn">是</span>{% else %}<span class="muted">否</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>六、发布历史</h2>
+    <div class="panel-actions"><span class="tag">{{ history | length }} 条</span></div>
+  </div>
+  {% if history %}
+  <div class="table-wrap auto">
+    <table class="dense">
+      <thead><tr><th style="width:96px">版本</th><th style="width:180px">水位</th><th style="width:64px">待定</th>
+        <th style="width:76px">覆盖率</th><th style="width:48px">分级</th><th style="width:180px">发布时间</th>
+        <th style="width:96px">状态</th><th style="width:90px">导出</th></tr></thead>
+      <tbody>
+        {% for p in history %}
+        <tr>
+          <td class="mono small">v{{ p.version }}r{{ p.revision }}</td>
+          <td class="small muted nowrap">{{ p.release.watermark.time or '—' }}</td>
+          <td class="num">{{ p.release.pending_tail.cells }}</td>
+          <td class="num">{{ p.release.coverage.coverage | pct(2) }}</td>
+          <td><span class="tag {% if p.release.coverage.grade == 'A' %}ok{% elif p.release.coverage.grade == 'B' %}warn{% else %}err{% endif %}">{{ p.release.coverage.grade }}</span></td>
+          <td class="small muted nowrap">{{ p.created_at }}</td>
+          <td>{% if p.live %}<span class="tag ok">当前 live</span>{% else %}<span class="muted small">历史</span>{% endif %}</td>
+          <td><a class="small" href="/api/shift/export.csv?device_id={{ selected_device }}&metric={{ selected_metric }}&version={{ p.version }}">CSV</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="panel-body tight"><p class="small muted" style="margin:0">该序列还没有发布记录；核验通过后点「核验并发布」。</p></div>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}
+{% block scripts %}
+<script src="/static/shift.js"></script>
+{% endblock %}

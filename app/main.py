@@ -1,14 +1,15 @@
 """FastAPI 路由（薄）：只做参数解析、调用 pipeline、渲染页面。"""
 from __future__ import annotations
 
+import json
 import pathlib
-
+from functools import partial
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import pipeline, quality, seed, settings, store
+from . import pipeline, quality, seed, settings, shift, store
 
 BASE = pathlib.Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
@@ -152,6 +153,7 @@ def result(request: Request, run_id: str):
     payload = store.get_run(run_id)
     if payload is None:
         raise HTTPException(status_code=404, detail=f"运行 {run_id} 不存在，请回到工作台重新执行对齐")
+    live_shift = store.get_live_shift(payload["dataset_id"], payload["device_id"], payload["metric"])
     return templates.TemplateResponse(
         request,
         "result.html",
@@ -162,6 +164,7 @@ def result(request: Request, run_id: str):
             run=payload,
             metric_label=payload.get("metric_label"),
             metric_unit=payload.get("metric_unit", ""),
+            live_shift=live_shift,
         ),
     )
 
@@ -321,3 +324,267 @@ def api_report_csv(threshold: float | None = None):
 @app.get("/api/datasets")
 def api_datasets():
     return {"datasets": store.list_datasets()}
+
+
+# ---------------------------------------------------------------------------
+# 班次交接：成熟水位 / 待定尾部 / 版本化发布
+# ---------------------------------------------------------------------------
+
+
+def _shift_request(body, dataset):
+    """解析并校验交接参数，返回 (device, metric, handover, late_batches, late_records, threshold)。"""
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+    device_id = (body.get("device_id") or "").strip()
+    metric = (body.get("metric") or "").strip()
+    if not device_id:
+        raise HTTPException(status_code=400, detail="缺少 device_id")
+    if not metric:
+        raise HTTPException(status_code=400, detail="缺少 metric")
+    if device_id not in dataset.devices():
+        raise HTTPException(
+            status_code=400,
+            detail=f"设备 {device_id} 不在当前数据集（可用：{'、'.join(dataset.devices())}）",
+        )
+    if metric not in dataset.metrics_for(device_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"设备 {device_id} 没有指标 {metric}（可用：{'、'.join(dataset.metrics_for(device_id))}）",
+        )
+    handover_raw = body.get("handover_at")
+    if handover_raw is None or handover_raw == "":
+        raise HTTPException(status_code=400, detail="缺少 handover_at（交班时刻，ISO-8601 或 epoch 秒）")
+    try:
+        handover = shift.parse_time(handover_raw)
+        late = shift.normalize_late_batches(body.get("late_batches"))
+        records = shift.normalize_late_records(body.get("late_records"))
+    except shift.ReleaseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    threshold = _parse_threshold(body.get("offset_threshold"))
+
+    window = (dataset.window_start, dataset.window_end)
+    if handover < window[0]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"交班时刻早于数据集窗口起点 {shift.iso(window[0])}",
+        )
+    return device_id, metric, handover, late, records, threshold
+
+
+def _shift_publication_view(wrapper: dict) -> dict:
+    release = wrapper["release"]
+    return {
+        "publication_id": wrapper["publication_id"],
+        "version": wrapper["version"],
+        "revision": wrapper["revision"],
+        "version_id": wrapper["version_id"],
+        "prev_version": wrapper.get("prev_version"),
+        "prev_revision": wrapper.get("prev_revision"),
+        "digest": wrapper["digest"],
+        "handover_at": wrapper.get("handover_at"),
+        "created_at": wrapper.get("created_at"),
+        "live": wrapper.get("live", True),
+        "watermark": release["watermark"],
+        "pending_tail": release["pending_tail"],
+        "coverage": release["coverage"],
+        "shift_summary": release["shift_summary"],
+        "diff": wrapper.get("diff"),
+    }
+
+
+def _shift_payload(dataset, device_id, metric, handover, late, threshold, records=None) -> dict:
+    # 水位只前进：已有 live 版时，以它的水位为下限
+    live = store.get_live_shift(dataset.dataset_id, device_id, metric)
+    floor = live["release"]["watermark"]["bucket"] if live else None
+    release = shift.build_release(
+        dataset, device_id, metric, handover, late, threshold, records, min_watermark=floor
+    )
+    plan = store.peek_shift_plan(dataset.dataset_id, device_id, metric, release["watermark"]["bucket"], release["digest"])
+    diff = shift.diff_releases(live["release"] if live else None, release)
+    return release, plan, live, diff
+
+
+@app.post("/api/shift/preview")
+async def api_shift_preview(request: Request):
+    """只算不发布：给出水位、待定尾部、若发布会落到的版本，以及与当前 live 版的差异。"""
+    dataset = get_dataset()
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON") from None
+    device_id, metric, handover, late, records, threshold = _shift_request(body, dataset)
+    release, plan, live, diff = _shift_payload(dataset, device_id, metric, handover, late, threshold, records)
+    try:
+        shift.verify_release(release, dataset)
+    except shift.ReleaseVerificationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "dataset_id": dataset.dataset_id,
+        "published": False,
+        "plan": plan,
+        "live": _shift_publication_view(live) if live else None,
+        "diff": diff,
+        "release": release,
+    }
+
+
+@app.post("/api/shift/publish")
+async def api_shift_publish(request: Request):
+    """整批核验 → 原子替换。核验失败返回 422 且上一版保持 live。"""
+    dataset = get_dataset()
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON") from None
+    device_id, metric, handover, late, records, threshold = _shift_request(body, dataset)
+    try:
+        live = store.get_live_shift(dataset.dataset_id, device_id, metric)
+        floor = live["release"]["watermark"]["bucket"] if live else None
+        release = shift.build_release(
+            dataset, device_id, metric, handover, late, threshold, records, min_watermark=floor
+        )
+        shift.verify_release(release, dataset)
+    except shift.ReleaseVerificationError as exc:
+        # 核验失败：不触碰数据库，上一版继续 live
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except shift.ReleaseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    wrapper = store.publish_shift(
+        dataset.dataset_id, release, partial(shift.diff_releases, cur=release)
+    )
+    return {
+        "dataset_id": dataset.dataset_id,
+        "published": True,
+        "reused": wrapper.get("reused", False),
+        "replaced": wrapper.get("replaced", True),
+        "publication": _shift_publication_view(wrapper),
+        "diff": wrapper.get("diff"),
+        "release": wrapper["release"],
+    }
+
+
+@app.get("/api/shift/live")
+def api_shift_live(device_id: str, metric: str):
+    dataset = get_dataset()
+    if device_id not in dataset.devices() or metric not in dataset.metrics_for(device_id):
+        raise HTTPException(status_code=400, detail=f"数据集里没有 {device_id} / {metric}")
+    live = store.get_live_shift(dataset.dataset_id, device_id, metric)
+    if live is None:
+        raise HTTPException(status_code=404, detail=f"{device_id} / {metric} 还没有已发布的交接版本")
+    return {
+        "dataset_id": dataset.dataset_id,
+        "publication": _shift_publication_view(live),
+        "release": live["release"],
+        "diff": live["diff"],
+    }
+
+
+@app.get("/api/shift/versions")
+def api_shift_versions(device_id: str, metric: str, limit: int = 20):
+    dataset = get_dataset()
+    if device_id not in dataset.devices() or metric not in dataset.metrics_for(device_id):
+        raise HTTPException(status_code=400, detail=f"数据集里没有 {device_id} / {metric}")
+    rows = store.list_shift_publications(dataset.dataset_id, device_id, metric, max(1, min(limit, 100)))
+    return {
+        "dataset_id": dataset.dataset_id,
+        "device_id": device_id,
+        "metric": metric,
+        "publications": [_shift_publication_view(row) for row in rows],
+    }
+
+
+@app.get("/api/shift/export.csv", response_class=PlainTextResponse)
+def api_shift_export_csv(device_id: str, metric: str, version: int | None = None):
+    """导出已发布的交接结果；version 省略时导出当前 live 版。"""
+    dataset = get_dataset()
+    if device_id not in dataset.devices() or metric not in dataset.metrics_for(device_id):
+        raise HTTPException(status_code=400, detail=f"数据集里没有 {device_id} / {metric}")
+    wrapper = (
+        store.get_shift_version(dataset.dataset_id, device_id, metric, version)
+        if version is not None
+        else store.get_live_shift(dataset.dataset_id, device_id, metric)
+    )
+    if wrapper is None:
+        label = f"v{version}" if version is not None else "已发布版本"
+        raise HTTPException(status_code=404, detail=f"{device_id} / {metric} 没有{label}，请先发布交接结果")
+    csv_text = shift.release_csv(wrapper)
+    filename = f"tsgrid-shift-{device_id}-{metric}-v{wrapper['version']}r{wrapper['revision']}.csv"
+    return PlainTextResponse(
+        csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/shift", response_class=HTMLResponse)
+def shift_page(
+    request: Request,
+    device: str = "",
+    metric: str = "",
+    at: str = "",
+    late: str = "",
+    threshold: str = "",
+):
+    dataset = get_dataset()
+    devices = dataset.devices()
+    device_id = device if device in devices else (DEFAULT_WORKBENCH_DEVICE if DEFAULT_WORKBENCH_DEVICE in devices else (devices[0] if devices else ""))
+    selected_metrics = dataset.metrics_for(device_id) if device_id else []
+    metric_name = metric if metric in selected_metrics else (selected_metrics[0] if selected_metrics else "")
+    handover_text = at or shift.iso(dataset.window_end + 5 * 60)
+    late_text = late.strip() or '{"late_batches": [], "late_records": []}'
+    threshold_text = threshold.strip() or str(settings.DEFAULT_OFFSET_THRESHOLD_S)
+    live = store.get_live_shift(dataset.dataset_id, device_id, metric_name) if metric_name else None
+    history = (
+        store.list_shift_publications(dataset.dataset_id, device_id, metric_name, 20) if metric_name else []
+    )
+    preview = None
+    error = None
+    if metric_name:
+        try:
+            handover = shift.parse_time(handover_text)
+            try:
+                threshold_s = float(threshold_text)
+            except ValueError:
+                raise shift.ReleaseError(f"偏移阈值必须是数字，实际收到 {threshold_text!r}") from None
+            if threshold_s <= 0 or threshold_s > 3600:
+                raise shift.ReleaseError("偏移阈值需在 0–3600 秒之间")
+            try:
+                late_body = json.loads(late_text)
+            except json.JSONDecodeError as exc:
+                raise shift.ReleaseError(f"补报登记不是合法 JSON：{exc}") from None
+            if not isinstance(late_body, dict):
+                raise shift.ReleaseError("补报登记必须是 JSON 对象（late_batches / late_records）")
+            batches = late_body.get("late_batches") or []
+            records = late_body.get("late_records") or []
+            release, plan, _, diff = _shift_payload(
+                dataset, device_id, metric_name, handover, batches, threshold_s, records
+            )
+            shift.verify_release(release, dataset)
+            preview = {"release": release, "plan": plan, "diff": diff}
+        except (shift.ReleaseError, shift.ReleaseVerificationError) as exc:
+            error = str(exc)
+    return templates.TemplateResponse(
+        request,
+        "shift.html",
+        _ctx(
+            request,
+            page="shift",
+            active="shift",
+            dataset=dataset,
+            inventory=dataset.inventory(),
+            devices=devices,
+            selected_device=device_id,
+            selected_metric=metric_name,
+            selected_metrics=selected_metrics,
+            metric_labels=settings.METRIC_LABEL,
+            handover_at=handover_text,
+            late_text=late_text,
+            threshold_text=threshold_text,
+            deadlines={d: shift.deadline_for(d) for d in devices},
+            live=live,
+            history=history,
+            preview=preview,
+            error=error,
+        ),
+    )
